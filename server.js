@@ -5,7 +5,7 @@ import mammoth from "mammoth";
 import fs from "fs";
 import dotenv from "dotenv";
 import cors from "cors";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenAI } from "@google/genai";
 
 dotenv.config();
 
@@ -13,91 +13,95 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ✅ API key check
+// =======================
+// ENV CHECK
+// =======================
 if (!process.env.GEMINI_API_KEY) {
-  console.error("❌ Gemini API key is missing. Add it in .env file as GEMINI_API_KEY=your_key_here");
+  console.error("❌ GEMINI_API_KEY missing in .env");
   process.exit(1);
-} else {
-  console.log("✅ Gemini API key loaded.");
 }
+console.log("✅ Gemini API key loaded");
 
-// Setup Gemini
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({
-  model: "models/gemini-1.5-flash",
-  generationConfig: {
-    responseMimeType: "application/json"
+// =======================
+// GEMINI CLIENT (NEW SDK)
+// =======================
+const genAI = new GoogleGenAI({
+  apiKey: process.env.GEMINI_API_KEY
+});
+
+// =======================
+// MULTER SETUP
+// =======================
+const upload = multer({
+  dest: "uploads/",
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  fileFilter: (req, file, cb) => {
+    const allowed = [
+      "application/pdf",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    ];
+    cb(null, allowed.includes(file.mimetype));
   }
 });
 
- // more accurate than flash
-
-// Multer setup for file upload
-const upload = multer({ dest: "uploads/" });
-
-// 🔹 Extract text from PDF/DOCX
+// =======================
+// TEXT EXTRACTION
+// =======================
 async function extractText(filePath, mimeType) {
-  console.log(`📄 Extracting text from: ${filePath} (${mimeType})`);
   if (mimeType === "application/pdf") {
-    const dataBuffer = fs.readFileSync(filePath);
-    const pdfData = await pdfParse(dataBuffer);
-    return pdfData.text;
-  } else if (
-    mimeType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    const buffer = fs.readFileSync(filePath);
+    const data = await pdfParse(buffer);
+    return data.text;
+  }
+
+  if (
+    mimeType ===
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
   ) {
     const result = await mammoth.extractRawText({ path: filePath });
     return result.value;
-  } else {
-    throw new Error("Unsupported file type. Upload PDF or DOCX.");
   }
+
+  throw new Error("Unsupported file type");
 }
 
-// 🔹 Analyze Resume with Gemini
+// =======================
+// GEMINI ANALYSIS
+// =======================
 async function analyzeResume(resumeText, jobTitle) {
   const prompt = `
-  You are an advanced AI-powered Applicant Tracking System (ATS) evaluator.  
-  Analyze the following resume text against the job title "${jobTitle}".  
+You are an advanced AI-powered Applicant Tracking System (ATS) evaluator.
 
-  ✅ Respond only with valid JSON (no markdown, no explanations).  
+Analyze the following resume against the job title "${jobTitle}".
 
-  ### Scoring Rules:
-  - atsScore: Integer 0–100  
-    * Skills Match (40%)  
-    * Experience Relevance (30%)  
-    * Formatting & Clarity (10%)  
-    * Keywords/ATS optimization (20%)  
+Respond ONLY with valid JSON. No markdown. No explanations.
 
-  ### Output JSON format:
-  {
-    "atsScore": number,
-    "roleDetected": "string",
-    "skills": {
-      "matched": ["skill1", "skill2"],
-      "missing": ["skill3", "skill4"]
-    },
-    "analysis": {
-      "summary": "feedback on resume summary",
-      "skillsSection": "feedback on skills section",
-      "experience": "feedback on work experience",
-      "projects": "feedback on projects section",
-      "education": "feedback on education section",
-      "formatting": "feedback on structure, readability, ATS-friendliness",
-      "keywords": "feedback on keyword density and missing keywords"
-    },
-    "suggestions": [
-      "specific actionable suggestion 1",
-      "specific actionable suggestion 2",
-      "specific actionable suggestion 3"
-    ]
-  }
+JSON FORMAT:
+{
+  "atsScore": number,
+  "roleDetected": "string",
+  "skills": {
+    "matched": ["skill1"],
+    "missing": ["skill2"]
+  },
+  "analysis": {
+    "summary": "string",
+    "skillsSection": "string",
+    "experience": "string",
+    "projects": "string",
+    "education": "string",
+    "formatting": "string",
+    "keywords": "string"
+  },
+  "suggestions": ["string"]
+}
 
-  Resume Text:
-  ${resumeText}
-  `;
+Resume Text:
+${resumeText}
+`;
 
-  try {
-    console.log("🤖 Sending request to Gemini...");
-const result = await model.generateContent({
+  const result = await genAI.models.generateContent({
+  model: "gemini-2.5-flash",
   contents: [
     {
       role: "user",
@@ -106,84 +110,73 @@ const result = await model.generateContent({
   ]
 });
 
-    const text = result.response.text();
-    console.log("✅ Gemini raw response received.");
-    return text;
-  } catch (error) {
-  console.error("❌ Gemini API call failed:");
-  console.error(error?.response?.data || error);
-  throw error;
-}
+return result.text;
 
 }
 
-// 🔹 Safe JSON parser
-function safeParseJSON(str) {
-  try {
-    return JSON.parse(str.trim().replace(/^\uFEFF/, ""));
-
-  } catch (err) {
-    console.error("❌ JSON parsing failed. Raw AI response:\n", str);
-    throw new Error("Failed to parse AI response as JSON.");
-  }
+// =======================
+// SAFE JSON PARSE
+// =======================
+function safeParseJSON(text) {
+  return JSON.parse(text.trim().replace(/^\uFEFF/, ""));
 }
 
-// 🔹 API Endpoint
+// =======================
+// API ROUTE
+// =======================
 app.post("/check-resume", upload.single("resume"), async (req, res) => {
   let filePath;
 
   try {
-    console.log("📩 New /check-resume request received.");
+    const { jobTitle } = req.body;
 
-    const jobTitle = req.body.jobTitle;
     if (!jobTitle) {
       return res.status(400).json({ error: "Job title required" });
     }
 
     if (!req.file) {
-      return res.status(400).json({ error: "Resume file is required (PDF or DOCX)" });
+      return res.status(400).json({ error: "Resume file required" });
     }
 
     filePath = req.file.path;
-    const mimeType = req.file.mimetype;
 
-    // Extract text
-    const resumeText = await extractText(filePath, mimeType);
-    console.log("📄 Resume text extracted. Length:", resumeText.length);
+    const resumeText = await extractText(
+      filePath,
+      req.file.mimetype
+    );
 
-    // Prevent token overflow
     const MAX_CHARS = 12000;
-    const safeResumeText = resumeText.slice(0, MAX_CHARS);
+    const safeText = resumeText.slice(0, MAX_CHARS);
 
-    // Analyze resume
-    let analysis = await analyzeResume(safeResumeText, jobTitle);
+    let analysis = await analyzeResume(safeText, jobTitle);
 
-    // Clean Gemini output (extra safety)
     analysis = analysis
       .replace(/```json/g, "")
       .replace(/```/g, "")
       .trim();
 
-    console.log("🧹 Cleaned AI response:", analysis);
-
-    // Parse JSON
     const parsed = safeParseJSON(analysis);
 
     res.json(parsed);
 
   } catch (err) {
-    console.error("❌ Error in /check-resume:", err);
+    console.error("❌ Resume analysis failed:", err);
     res.status(500).json({ error: "Resume analysis failed" });
 
   } finally {
-    // ✅ ALWAYS clean up uploaded file
     if (filePath && fs.existsSync(filePath)) {
       fs.unlinkSync(filePath);
-      console.log("🗑️ Temporary file deleted:", filePath);
     }
   }
 });
 
-
+// =======================
+// START SERVER
+// =======================
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
+
+
+
