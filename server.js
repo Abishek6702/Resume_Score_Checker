@@ -23,7 +23,14 @@ if (!process.env.GEMINI_API_KEY) {
 
 // Setup Gemini
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" }); // more accurate than flash
+const model = genAI.getGenerativeModel({
+  model: "models/gemini-1.5-flash",
+  generationConfig: {
+    responseMimeType: "application/json"
+  }
+});
+
+ // more accurate than flash
 
 // Multer setup for file upload
 const upload = multer({ dest: "uploads/" });
@@ -90,20 +97,31 @@ async function analyzeResume(resumeText, jobTitle) {
 
   try {
     console.log("🤖 Sending request to Gemini...");
-    const result = await model.generateContent(prompt);
+const result = await model.generateContent({
+  contents: [
+    {
+      role: "user",
+      parts: [{ text: prompt }]
+    }
+  ]
+});
+
     const text = result.response.text();
     console.log("✅ Gemini raw response received.");
     return text;
   } catch (error) {
-    console.error("❌ Gemini API call failed:", error.message);
-    throw new Error("Gemini API request failed. Check network/API key/model.");
-  }
+  console.error("❌ Gemini API call failed:");
+  console.error(error?.response?.data || error);
+  throw error;
+}
+
 }
 
 // 🔹 Safe JSON parser
 function safeParseJSON(str) {
   try {
-    return JSON.parse(str);
+    return JSON.parse(str.trim().replace(/^\uFEFF/, ""));
+
   } catch (err) {
     console.error("❌ JSON parsing failed. Raw AI response:\n", str);
     throw new Error("Failed to parse AI response as JSON.");
@@ -112,25 +130,35 @@ function safeParseJSON(str) {
 
 // 🔹 API Endpoint
 app.post("/check-resume", upload.single("resume"), async (req, res) => {
+  let filePath;
+
   try {
     console.log("📩 New /check-resume request received.");
+
     const jobTitle = req.body.jobTitle;
     if (!jobTitle) {
-      console.warn("⚠️ Job title missing in request.");
       return res.status(400).json({ error: "Job title required" });
     }
 
-    const filePath = req.file.path;
+    if (!req.file) {
+      return res.status(400).json({ error: "Resume file is required (PDF or DOCX)" });
+    }
+
+    filePath = req.file.path;
     const mimeType = req.file.mimetype;
 
-    // Extract text from resume
+    // Extract text
     const resumeText = await extractText(filePath, mimeType);
     console.log("📄 Resume text extracted. Length:", resumeText.length);
 
-    // Analyze resume with Gemini
-    let analysis = await analyzeResume(resumeText, jobTitle);
+    // Prevent token overflow
+    const MAX_CHARS = 12000;
+    const safeResumeText = resumeText.slice(0, MAX_CHARS);
 
-    // 🧹 Clean Gemini output
+    // Analyze resume
+    let analysis = await analyzeResume(safeResumeText, jobTitle);
+
+    // Clean Gemini output (extra safety)
     analysis = analysis
       .replace(/```json/g, "")
       .replace(/```/g, "")
@@ -138,19 +166,24 @@ app.post("/check-resume", upload.single("resume"), async (req, res) => {
 
     console.log("🧹 Cleaned AI response:", analysis);
 
-    // Parse JSON safely
+    // Parse JSON
     const parsed = safeParseJSON(analysis);
 
-    // Clean up uploaded file
-    fs.unlinkSync(filePath);
-    console.log("🗑️ Temporary file deleted:", filePath);
-
     res.json(parsed);
+
   } catch (err) {
-    console.error("❌ Error in /check-resume:", err.message);
-    res.status(500).json({ error: err.message });
+    console.error("❌ Error in /check-resume:", err);
+    res.status(500).json({ error: "Resume analysis failed" });
+
+  } finally {
+    // ✅ ALWAYS clean up uploaded file
+    if (filePath && fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+      console.log("🗑️ Temporary file deleted:", filePath);
+    }
   }
 });
+
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
